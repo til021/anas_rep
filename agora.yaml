@@ -1,0 +1,477 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Implantação do WordPress com Amazon ECS
+
+Parameters:
+  ClusterName:
+    Description: Nome do cluster ECS
+    Type: String
+    Default: WordpressCluster
+
+  InstanceSize:
+    Description: Tamanho da instância EC2
+    Type: String
+    Default: t2.micro
+
+  DBClass:
+    Description: Database instance class
+    Type: String
+    Default: db.t2.small
+    AllowedValues:
+      - db.t1.micro
+      - db.m1.small
+      - db.m1.medium
+      - db.t2.micro
+      - db.t2.small
+      - db.t2.medium
+      - db.t2.large
+    ConstraintDescription: must select a valid database instance type.
+
+  DBName:
+    Default: wordpressdb
+    Description: The WordPress database name
+    Type: String
+    MinLength: "1"
+    MaxLength: "64"
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+
+  DBUser:
+    NoEcho: "true"
+    Description: The WordPress database admin account username
+    Type: String
+    MinLength: "1"
+    MaxLength: "16"
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+
+  DBPassword:
+    NoEcho: "true"
+    Description: The WordPress database admin account password
+    Type: String
+    MinLength: "8"
+    MaxLength: "41"
+    AllowedPattern: "[a-zA-Z0-9]*"
+    ConstraintDescription: must contain only alphanumeric characters.
+
+Resources:
+
+
+  # VPC e Subnets -> para implantar a infraestrutura.
+  MyVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+
+  InternetGateway: # gateway da Internet para permitir a comunicação com a Internet.
+    Type: AWS::EC2::InternetGateway
+  AttachGateway: # Anexa o gateway da Internet à VPC.
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable: # Uma tabela de rotas para as subnets públicas.
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PublicRoute: # Uma rota pública para a Internet.
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+# Duas subnets públicas para instâncias EC2.
+  PublicSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      VpcId: !Ref MyVPC
+      CidrBlock: '10.0.1.0/24'
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs '']
+      VpcId: !Ref MyVPC
+      CidrBlock: '10.0.2.0/24'
+      MapPublicIpOnLaunch: true
+
+#Duas subnets privadas para o banco de dados.
+  PrivateSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      VpcId: !Ref MyVPC
+      CidrBlock: '10.0.3.0/24'
+
+  PrivateSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs '']
+      VpcId: !Ref MyVPC
+      CidrBlock: '10.0.4.0/24'
+
+  PublicSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+# Grupo de segurança para o banco de dados RDS.
+  DatabaseSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Database SG
+      VpcId: !Ref MyVPC
+# AWS Secrets Manager para as credenciais do banco de dados.
+  DatabaseCredentials:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub "${AWS::StackName}-DBCredentials"
+      Description: Database credentials for WordPress
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+
+# Grupo de subnets para o banco de dados RDS.
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub ${AWS::StackName}-Database-SNG
+      DBSubnetGroupDescription: !Sub ${AWS::StackName} Database Subnet Group.
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+#  Chave e alias do AWS Key Management Service (KMS) para criptografar as credenciais do banco de dados.
+  DatabaseCredentialsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: !Sub ${AWS::StackName}-DBCreds-Key
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+  DatabaseCredentialsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-DBCreds-Key
+      TargetKeyId: !Ref DatabaseCredentialsKMSKey
+
+  DatabaseEncryptionKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: !Sub ${AWS::StackName}-DBEncry-Key
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+  DatabaseEncryptionKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-DBEncry-Key
+      TargetKeyId: !Ref DatabaseEncryptionKMSKey
+
+  WordpressLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub ${AWS::StackName}-wordpress-logs
+      RetentionInDays: 14
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: !Ref DBClass
+      DBName: !Ref DBName
+      Engine: mysql
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      MultiAZ: true
+      PubliclyAccessible: false
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 3072
+      BackupRetentionPeriod: 1
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      StorageType: gp2
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt DatabaseEncryptionKMSKey.Arn
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+
+  # EFS
+  # Um sistema de arquivos elástico usado para armazenar os arquivos do WordPress.
+  WordpressEFS:
+    Type: 'AWS::EFS::FileSystem'
+
+  # Security Groups
+  # Grupo de segurança para o balanceador de carga.
+  ELBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: ELB SG
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
+#Grupo de segurança para as instâncias EC2 do Amazon ECS.
+  ECSSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: ECS SG
+      VpcId: !Ref MyVPC
+
+  # Load Balancer
+  #para rotear o tráfego para as instâncias ECS.
+  LoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ELBSecurityGroup
+
+  LoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref MyVPC
+      Port: 80
+      Protocol: HTTP
+      Matcher:
+        HttpCode: 200-299,302
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      TargetType: instance  # Alterado para 'instance' em vez de 'ip'
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.type
+          Value: lb_cookie
+
+  LoadBalancerHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LoadBalancerTargetGroup
+  
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-ECSTaskExecutionRole
+      Description: !Sub ${AWS::StackName} ECS Task Execution Role.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  ECSTaskExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-ECSTaskExecutionRolePolicy
+      Roles:
+        - !Ref ECSTaskExecutionRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - kms:Decrypt
+            Resource:
+              - !Ref DatabaseCredentials
+              - !GetAtt DatabaseCredentialsKMSKey.Arn
+              
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-ECSTaskRole
+      Description: !Sub ${AWS::StackName} ECS Task Role.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+# Role e policy para as tasks do Amazon ECS interagirem com o Amazon CloudWatch Logs e o AWS Systems Manager
+  ECSTaskRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-ECSTaskRolePolicy
+      Roles:
+        - !Ref ECSTaskRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !GetAtt WordpressLogGroup.Arn
+          - Effect: Allow
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Resource: '*'
+
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: ECSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:CreateCluster
+                  - ecs:DeregisterContainerInstance
+                  - ecs:DiscoverPollEndpoint
+                  - ecs:Poll
+                  - ecs:RegisterContainerInstance
+                  - ecs:StartTelemetrySession
+                  - ecs:Submit*
+                Resource: '*'
+#  perfil de instância para as instâncias EC2 usadas no Amazon ECS.
+# nao entendi
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - Ref: ECSRole
+
+# Grupo de dimensionamento automático para as instâncias EC2.
+  ECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchConfigurationName: !Ref ECSLaunchConfiguration
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+# Configuração de inicialização para as instâncias EC2.
+  ECSLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      InstanceType: !Ref InstanceSize
+      ImageId: 'ami-0ecafab2c8b422b1a'
+      IamInstanceProfile: !Ref ECSInstanceProfile
+      SecurityGroups:
+        - !Ref ECSSecurityGroup
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${WordpressCluster} >> /etc/ecs/ecs.config
+
+#  Cluster do Amazon ECS para implantar os contêineres do WordPress.
+  WordpressCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: !Ref ClusterName
+
+# Definição de tarefa para os contêineres do WordPress.
+  WordpressTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      ContainerDefinitions:
+        - Name: !FindInMap [ NameConfig, Container, Name ]
+          Image: wordpress:latest
+          MemoryReservation: 512 #
+          Essential: true
+          Cpu: 256
+          PortMappings:
+            - ContainerPort: 80
+          Environment:
+            - Name: WORDPRESS_DB_HOST
+              Value: !Ref DBName
+            - Name: WORDPRESS_DB_NAME
+              Value: !Ref DBName
+            - Name: WORDPRESS_DB_USER
+              Value: !Ref DBUser
+            - Name: WORDPRESS_DB_PASSWORD
+              Value: !Ref DBPassword
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group: !Ref WordpressLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: 'wordpress'
+# p/  implantar os contêineres do WordPress.
+  WordpressService:
+    Type: 'AWS::ECS::Service'
+    Properties:
+      Cluster: !Ref WordpressCluster
+      TaskDefinition: !Ref WordpressTaskDefinition
+      LaunchType: EC2
+      LoadBalancers:
+        - TargetGroupArn: !Ref LoadBalancerTargetGroup
+          ContainerName: !FindInMap [ NameConfig, Container, Name ] # Usando a mesma referência do Name no TaskDefinition
+          ContainerPort: 80
+      DesiredCount: 1
+      DeploymentConfiguration: # Configuração opcional de implantação, útil para definições de implantação em larga escala
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+  # ... outros recursos, como RDS para banco de dados, etc ...
+
+Mappings:
+  NameConfig:
+    Container:
+      Name: wordpress
+
+Outputs:
+  WordpressURL:
+    Description: URL para acessar o WordPress
+    Value: !Sub "http://${LoadBalancer.DNSName}"

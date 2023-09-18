@@ -118,6 +118,7 @@ Resources:
       FromPort: 31000
       ToPort: 61000
       SourceSecurityGroupId: !Ref EcsSecurityGroup
+# Cria um grupo de logs do CloudWatch para os contêineres do ECS.
   CloudwatchLogsGroup:
     Type: 'AWS::Logs::LogGroup'
     Properties:
