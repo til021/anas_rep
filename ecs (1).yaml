@@ -1,5 +1,6 @@
 AWSTemplateFormatVersion: 2010-09-09
 Parameters:
+# chave EC2 existente para permitir o acesso SSH às instâncias do ECS.
   KeyName:
     Type: 'AWS::EC2::KeyPair::KeyName'
     Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.
@@ -9,6 +10,7 @@ Parameters:
   SubnetId:
     Type: 'List<AWS::EC2::Subnet::Id>'
     Description: Select at least two subnets in your selected VPC.
+    #O número de instâncias a serem lançadas no cluster ECS.
   DesiredCapacity:
     Type: Number
     Default: '1'
@@ -85,15 +87,17 @@ Mappings:
   AWSRegionToAMI:
     us-east-1:
       AMIID: ami-09bee01cc997a78a6
-    # Adicione mapeamentos para outras regi?es aqui
+
 Resources:
   ECSCluster:
     Type: 'AWS::ECS::Cluster'
+
   EcsSecurityGroup:
     Type: 'AWS::EC2::SecurityGroup'
     Properties:
       GroupDescription: ECS Security Group
       VpcId: !Ref VpcId
+#  Configura regras de segurança de grupo para permitir tráfego HTTP (porta 80) e SSH (porta 22) para o ECS.
   EcsSecurityGroupHTTPinbound:
     Type: 'AWS::EC2::SecurityGroupIngress'
     Properties:
@@ -110,6 +114,7 @@ Resources:
       FromPort: 22
       ToPort: 22
       CidrIp: 0.0.0.0/0
+# regras de segurança de grupo para permitir tráfego entre o ECS e o balanceador de carga.
   EcsSecurityGroupALBports:
     Type: 'AWS::EC2::SecurityGroupIngress'
     Properties:
@@ -118,7 +123,7 @@ Resources:
       FromPort: 31000
       ToPort: 61000
       SourceSecurityGroupId: !Ref EcsSecurityGroup
-# Cria um grupo de logs do CloudWatch para os contêineres do ECS.
+# grupo de logs do CloudWatch para os contêineres do ECS.
   CloudwatchLogsGroup:
     Type: 'AWS::Logs::LogGroup'
     Properties:
@@ -127,6 +132,7 @@ Resources:
         - - ECSLogGroup
           - !Ref 'AWS::StackName'
       RetentionInDays: 14
+#  instância RDS para o banco de dados do WordPress.
   DBInstance:
     Type: 'AWS::RDS::DBInstance'
     Properties:
@@ -141,6 +147,7 @@ Resources:
         - !GetAtt 
           - DBEC2SecurityGroup
           - GroupId
+  # definição de task ECS para os contêineres do WordPress.
   taskdefinition:
     Type: 'AWS::ECS::TaskDefinition'
     Properties:
@@ -168,6 +175,7 @@ Resources:
       Volumes:
         - Name: my-vol
           Host: {}
+# balanceador de carga da AWS, um ouvinte e um grupo de destino para encaminhar o tráfego para as instâncias ECS.
   ALB:
     Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
     Properties:
@@ -201,6 +209,7 @@ Resources:
       Protocol: HTTP
       TargetType: instance
       VpcId: !Ref VpcId
+# grupo de segurança para as EC2.
   WebServerSecurityGroup:
     Type: 'AWS::EC2::SecurityGroup'
     Properties:
@@ -220,6 +229,7 @@ Resources:
           ToPort: '22'
           CidrIp: 0.0.0.0/0
       VpcId: !Ref VpcId
+
   WebServerLaunchConfig:
     Type: 'AWS::AutoScaling::LaunchConfiguration'
     Properties:
@@ -296,6 +306,7 @@ Resources:
                         Order allow,deny
                         Allow from all
                       </Directory>
+# Define um grupo de dimensionamento automático para as instâncias EC2.
   WebServerGroup:
     Type: 'AWS::AutoScaling::AutoScalingGroup'
     Properties:
@@ -315,6 +326,8 @@ Resources:
         MaxBatchSize: '1'
         PauseTime: PT15M
         WaitOnResourceSignals: 'true'
+
+# grupo de segurança para permitir o acesso ao banco de dados RDS.
   DBEC2SecurityGroup:
     Type: 'AWS::EC2::SecurityGroup'
     Properties:
